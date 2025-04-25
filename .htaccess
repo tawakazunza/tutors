@@ -1,0 +1,17 @@
+RewriteEngine On
+RewriteBase /tutors/
+
+# Skip rewriting for existing files and directories
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{REQUEST_FILENAME} !-l
+
+# Rewrite tutor profiles
+RewriteRule ^tutor-profile/([^/]+)/?$ tutor-profile.php?slug=$1 [L,QSA]
+
+# Optional: Allow images, CSS, JS to be accessed directly
+RewriteRule ^(uploads|vendors|css|js|images)/.*$ - [L]
+
+# Prevent direct access to PHP files
+RewriteCond %{THE_REQUEST} ^[A-Z]{3,}\s/+tutors/tutor-profile\.php [NC]
+RewriteRule ^ - [R=404,L]
