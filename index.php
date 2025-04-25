@@ -1,11 +1,12 @@
 <?php
 include 'config.php';
 
-// Filters
+// Get all filter parameters
 $subject = isset($_GET['subject']) ? intval($_GET['subject']) : null;
 $grade = isset($_GET['grade']) ? intval($_GET['grade']) : null;
 $city = isset($_GET['city']) ? intval($_GET['city']) : null;
 $method = isset($_GET['method']) ? $_GET['method'] : null;
+$name_search = isset($_GET['name_search']) ? trim($_GET['name_search']) : null;
 
 $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
 $limit = 6;
@@ -14,27 +15,40 @@ $offset = ($page - 1) * $limit;
 // Query builder
 $conditions = [];
 $params = [];
+$param_types = ''; // Track parameter types for prepared statement
 
 // Track which tables we've already joined
 $joined_tables = [];
 
+// Name search condition (modified to work with LIKE)
+if (!empty($name_search)) {
+    $conditions[] = "t.full_name LIKE ?";
+    $params[] = '%' . $name_search . '%';
+    $param_types .= 's';
+}
+
+// Existing filter conditions
 if ($subject) {
     $joined_tables['tutor_subjects'] = true;
     $conditions[] = "ts_filter.subject_id = ?";
     $params[] = $subject;
+    $param_types .= 'i';
 }
 if ($grade) {
     $joined_tables['tutor_grades'] = true;
     $conditions[] = "tg_filter.grade_id = ?";
     $params[] = $grade;
+    $param_types .= 'i';
 }
 if ($city) {
     $conditions[] = "t.location_id = ?";
     $params[] = $city;
+    $param_types .= 'i';
 }
 if ($method) {
     $conditions[] = "t.teaching_method = ?";
     $params[] = $method;
+    $param_types .= 's';
 }
 
 $where = count($conditions) ? "WHERE " . implode(" AND ", $conditions) : "";
@@ -70,31 +84,39 @@ $query = "
     GROUP BY t.id
     LIMIT $limit OFFSET $offset
 ";
-
+// Get total count for pagination
 $count_query = "
     SELECT COUNT(DISTINCT t.id) as total 
     FROM tutors t 
+    LEFT JOIN cities c ON t.location_id = c.id
+    LEFT JOIN tutor_subjects ts ON ts.tutor_id = t.id
+    LEFT JOIN subjects s ON ts.subject_id = s.id
+    LEFT JOIN tutor_payment_methods tpm ON tpm.tutor_id = t.id
+    LEFT JOIN payment_methods pm ON tpm.payment_method_id = pm.id
+    LEFT JOIN tutor_grades tg ON tg.tutor_id = t.id
+    LEFT JOIN grades g ON tg.grade_id = g.id
+    LEFT JOIN reviews r ON r.tutor_id = t.id
     $joins 
     $where
 ";
 
+$count_stmt = $conn->prepare($count_query);
+if (!empty($params)) {
+    $count_stmt->bind_param($param_types, ...$params);
+}
+$count_stmt->execute();
+$count_result = $count_stmt->get_result();
+$total_rows = $count_result->fetch_assoc()['total'];
+$total_pages = ceil($total_rows / $limit);
+
+// Prepare and execute the query
 $stmt = $conn->prepare($query);
-if ($params) {
-    $types = str_repeat("i", count($params));
-    $stmt->bind_param($types, ...$params);
+if (!empty($params)) {
+    $stmt->bind_param($param_types, ...$params);
 }
 $stmt->execute();
 $result = $stmt->get_result();
 
-// Get total count for pagination
-$count_stmt = $conn->prepare($count_query);
-if ($params) {
-    $types = str_repeat("i", count($params));
-    $count_stmt->bind_param($types, ...$params);
-}
-$count_stmt->execute();
-$total_rows = $count_stmt->get_result()->fetch_assoc()['total'];
-$total_pages = ceil($total_rows / $limit);
 ?>
 
 <!DOCTYPE html>
@@ -157,18 +179,19 @@ $total_pages = ceil($total_rows / $limit);
     <div class="bg-primary py-2">
         <div class="container">
             <div class="row">
+                <div class="col-lg-3"></div>
                 <!-- Left side links - collapses on mobile with toggle button -->
-                <div class="col-lg-8 col-md-6 d-none d-md-block">
+                <div class="col-lg-6 col-md-6 d-none d-md-block topbar">
                     <div class="d-flex">
-                        <a href="https://openclass.co.zw/frequently-asked-questions-on-schools-in-zimbabwe/" class="text-white mr-3">FAQ's On Schools In Zim</a>
-                        <a href="https://openclass.co.zw/teacher-swops/" class="text-white mr-3">Teacher Swops</a>
-                        <a href="https://openclass.co.zw/notes/" class="text-white mr-3">Notes</a>
+                        <a href="https://openclass.co.zw/frequently-asked-questions-on-schools-in-zimbabwe/" class="text-white mr-3">FAQ's On Schools In Zim |</a>
+                        <a href="https://openclass.co.zw/teacher-swops/" class="text-white mr-3">Teacher Swops |</a>
+                        <a href="https://openclass.co.zw/notes/" class="text-white mr-3">Notes |</a>
                         <a href="https://openclass.co.zw/contribute/" class="text-white">Contribute</a>
                     </div>
                 </div>
 
                 <!-- Right side social icons - always visible -->
-                <div class="col-lg-4 col-md-6 col-12 text-md-right text-center">
+                <div class="col-lg-3 col-md-6 col-12 text-md-right text-center">
                     <a href="https://www.facebook.com/groups/846304606191536" class="text-white mx-2"><i class="fab fa-facebook-f"></i></a>
                     <a href="mailto:learn@openclass.co.zw" class="text-white mx-2"><i class="fas fa-envelope"></i></a>
                     <a href="https://www.linkedin.com/groups/9876043/" class="text-white mx-2"><i class="fab fa-linkedin-in"></i></a>
@@ -182,10 +205,7 @@ $total_pages = ceil($total_rows / $limit);
         <div class="container">
             <nav class="navbar navbar-expand-lg navbar-light p-0">
                 <!-- Logo area -->
-                <a class="navbar-brand" href="#">
-                    <!-- Logo can go here -->
-                    <img src="images/openclass.webp" alt="Openclass" width="200" height="40">
-                </a>
+                
 
                 <!-- Mobile hamburger menu -->
                 <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#mainNavbar"
@@ -242,7 +262,7 @@ $total_pages = ceil($total_rows / $limit);
 
                     <!-- Facebook button -->
                     <div class="my-2 my-lg-0">
-                        <a href="tutor-login.php" class="btn btn-danger rounded-pill px-2">Tutor Login </a>
+                        <a style="radius: 50px;" href="tutor-login.php" class="btn btn-danger rounded-pill px-2" data-toggle="tooltip" data-placement="bottom" title="Whatsapp Group With Tutors">Join Whatsapp Group</a>
                     </div>
 
                 </div>
@@ -254,23 +274,13 @@ $total_pages = ceil($total_rows / $limit);
     <div class="bg-light py-2">
         <div class="container">
             <div class="row justify-content-center">
-                <div class="col-lg-8 col-md-10 col-12">
-                    <div class="input-group">
-                        <input type="text" class="form-control" placeholder="Search...">
-                        <div class="input-group-append">
-                            <button class="btn btn-danger" type="button">
-                                <i class="fas fa-search"></i>
-                            </button>
-                        </div>
-                    </div>
-                </div>
             </div>
         </div>
     </div>
 
     <style>
         .bg-primary {
-            background-color: #0F1E8A !important; /* Dark blue from your screenshot */
+            background-color: #0F1E8A !important; 
         }
         /* Font styles */
         body {
@@ -281,9 +291,21 @@ $total_pages = ceil($total_rows / $limit);
             font-family: 'Merriweather', serif;
         }
 
+        .topbar {
+            font-family: 'Merriweather', sans-serif;
+            font-weight: 400;
+            size:0.875rem !important;
+        }
+
+        #mainNavbar {
+            height: 90px !important;
+        }
+
         .nav-link {
-            font-family: 'Noto Sans Georgian', sans-serif;
-            font-weight: 600;
+            font-family: 'Merriweather', sans-serif;
+            font-weight: 700;
+            color:  #0F1E8A !important;
+            size:16px
         }
 
         .btn {
@@ -302,11 +324,11 @@ $total_pages = ceil($total_rows / $limit);
         }
 
         .nav-link.active {
-            border-bottom: 2px solid #dc3545;
+            border-bottom: 2px solid #B12929;
         }
 
         .btn-danger {
-            background-color: #dc3545;
+            background-color: #B12929;
         }
         .payment-pills {
             display: inline-flex;
@@ -339,7 +361,7 @@ $total_pages = ceil($total_rows / $limit);
 
             .nav-link.active {
                 border-bottom: none;
-                border-left: 4px solid #dc3545;
+                border-left: 4px solid #B12929;
                 padding-left: 0.5rem;
             }
 
@@ -355,13 +377,28 @@ $total_pages = ceil($total_rows / $limit);
     <style>
         /* Ensure image has proper height */
         .hero-image {
-            height: 300px;
+            height: 420px;
             object-fit: cover;
         }
 
         /* Responsive heading size */
         .hero-heading {
             font-size: 1.75rem;
+        }
+                .subject-pill {
+            display: inline-block;
+            margin-right: 5px;
+            margin-bottom: 10px;
+            padding: 0.50em 0.8em;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-decoration: none;
+        }
+
+        .subject-pill:hover {
+            background-color: #E2322D !important;
+            color: white !important;
+            transform: translateY(-1px);
         }
 
 
@@ -479,8 +516,8 @@ $total_pages = ceil($total_rows / $limit);
             }
         }
     </style>
-    <!-- Hero Section -->
-    <section class="hero-section">
+<!-- Hero Section -->
+<section class="hero-section">
         <div class="container-fluid p-0">
             <div class="row no-gutters">
                 <!-- Left side image - full width on mobile, half on desktop -->
@@ -531,59 +568,96 @@ $total_pages = ceil($total_rows / $limit);
             </script>
         </div>
 
-        <!-- Search Filters -->
-        <form id="tutorFilterForm" method="get" class="row g-3 mb-4">
-            <div class="col-md-3">
-                <select name="subject" class="form-control">
-                    <option value="">All Subjects</option>
-                    <?php
-                    $subs = $conn->query("SELECT * FROM subjects");
-                    while ($s = $subs->fetch_assoc()) {
-                        $selected = ($subject == $s['id']) ? "selected" : "";
-                        echo "<option value='{$s['id']}' $selected>{$s['name']}</option>";
-                    }
-                    ?>
-                </select>
+                <!-- Search bar with name search and filters -->
+        <div class="bg-light py-3">
+            <div class="container">
+                <form id="tutorSearchForm" method="get" class="row g-3">
+                    <!-- Hidden fields to preserve other filters when searching by name -->
+                    <?php if ($subject): ?>
+                        <input type="hidden" name="subject" value="<?= $subject ?>">
+                    <?php endif; ?>
+                    <?php if ($grade): ?>
+                        <input type="hidden" name="grade" value="<?= $grade ?>">
+                    <?php endif; ?>
+                    <?php if ($city): ?>
+                        <input type="hidden" name="city" value="<?= $city ?>">
+                    <?php endif; ?>
+                    <?php if ($method): ?>
+                        <input type="hidden" name="method" value="<?= $method ?>">
+                    <?php endif; ?>
+                    
+                    <!-- Name Search Field -->
+                    <div class="col-md-4">
+                        <div class="input-group">
+                            <input type="text" name="name_search" class="form-control" 
+                                placeholder="Search by tutor name..." 
+                                value="<?= htmlspecialchars($name_search ?? '') ?>">
+                            <div class="input-group-append">
+                                <button class="btn btn-danger" type="submit">
+                                    <i class="fas fa-search"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Existing Filters -->
+                    <div class="col-md-2">
+                        <select name="subject" class="form-control" onchange="this.form.submit()">
+                            <option value="">All Subjects</option>
+                            <?php
+                            $subs = $conn->query("SELECT * FROM subjects");
+                            while ($s = $subs->fetch_assoc()) {
+                                $selected = ($subject == $s['id']) ? "selected" : "";
+                                echo "<option value='{$s['id']}' $selected>{$s['name']}</option>";
+                            }
+                            ?>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-2">
+                        <select name="grade" class="form-control" onchange="this.form.submit()">
+                            <option value="">All Grades</option>
+                            <?php
+                            $grades_list = $conn->query("SELECT * FROM grades");
+                            while ($g = $grades_list->fetch_assoc()) {
+                                $selected = ($grade == $g['id']) ? "selected" : "";
+                                echo "<option value='{$g['id']}' $selected>{$g['level_name']}</option>";
+                            }
+                            ?>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-2">
+                        <select name="city" class="form-control" onchange="this.form.submit()">
+                            <option value="">All Locations</option>
+                            <?php
+                            $cities = $conn->query("SELECT * FROM cities");
+                            while ($c = $cities->fetch_assoc()) {
+                                $selected = ($city == $c['id']) ? "selected" : "";
+                                echo "<option value='{$c['id']}' $selected>{$c['name']}</option>";
+                            }
+                            ?>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-2">
+                        <select name="method" class="form-control" onchange="this.form.submit()">
+                            <option value="">All Methods</option>
+                            <option value="online" <?= $method == "online" ? "selected" : "" ?>>Online</option>
+                            <option value="in_person" <?= $method == "in_person" ? "selected" : "" ?>>In Person</option>
+                            <option value="both" <?= $method == "both" ? "selected" : "" ?>>Both</option>
+                        </select>
+                    </div>
+                    
+                    <div class="col-md-12 mt-2 text-center">
+                        <a href="?" class="btn btn-secondary">Reset All Filters</a>
+                    </div>
+                </form>
             </div>
-            <div class="col-md-3">
-                <select name="grade" class="form-control">
-                    <option value="">All Grades</option>
-                    <?php
-                    $grades_list = $conn->query("SELECT * FROM grades");
-                    while ($g = $grades_list->fetch_assoc()) {
-                        $selected = ($grade == $g['id']) ? "selected" : "";
-                        echo "<option value='{$g['id']}' $selected>{$g['level_name']}</option>";
-                    }
-                    ?>
-                </select>
-            </div>
-            <div class="col-md-3">
-                <select name="city" class="form-control">
-                    <option value="">All Locations</option>
-                    <?php
-                    $cities = $conn->query("SELECT * FROM cities");
-                    while ($c = $cities->fetch_assoc()) {
-                        $selected = ($city == $c['id']) ? "selected" : "";
-                        echo "<option value='{$c['id']}' $selected>{$c['name']}</option>";
-                    }
-                    ?>
-                </select>
-            </div>
-            <div class="col-md-3">
-                <select name="method" class="form-control">
-                    <option value="">All Methods</option>
-                    <option value="online" <?= $method == "online" ? "selected" : "" ?>>Online</option>
-                    <option value="in_person" <?= $method == "in_person" ? "selected" : "" ?>>In Person</option>
-                    <option value="both" <?= $method == "both" ? "selected" : "" ?>>Both</option>
-                </select>
-            </div>
-            <div class="col-md-12">
-                <button type="submit" class="btn-lg btn btn-primary">Filter Tutors</button>
-            </div>
-        </form>
+        </div>
 
         <!-- Tutors Grid -->
-        <div class="row">
+        <div class="row mt-4">
             <?php
             $counter = 0;
             while ($tutor = $result->fetch_assoc()):
@@ -638,7 +712,33 @@ $total_pages = ceil($total_rows / $limit);
                         <p class="card-text">
                             <strong>Subjects:</strong>
                             <?php if(!empty($tutor['subjects'])): ?>
-                                <?= htmlspecialchars($tutor['subjects']) ?>
+                                <?php 
+                                // First, store the exploded subjects in a variable
+                                $subject_list = explode(', ', $tutor['subjects']);
+                                
+                                // Then loop through the variable
+                                foreach($subject_list as $subject_name): 
+                                    // Clean up the subject name
+                                    $subject_name = trim($subject_name);
+                                    
+                                    // Get subject ID for this subject name
+                                    $subj_stmt = $conn->prepare("SELECT id FROM subjects WHERE name = ?");
+                                    $subj_stmt->bind_param("s", $subject_name);
+                                    $subj_stmt->execute();
+                                    $subj_result = $subj_stmt->get_result();
+                                    $subject_data = $subj_result->fetch_assoc();
+                                    $subject_id = $subject_data['id'] ?? 0;
+                                    
+                                    // Build URL with all current filters plus the subject filter
+                                    $filter_params = $_GET;
+                                    $filter_params['subject'] = $subject_id;
+                                    if (isset($filter_params['page'])) unset($filter_params['page']);
+                                    $filter_url = http_build_query($filter_params);
+                                ?>
+                                    <a href="?<?= htmlspecialchars($filter_url) ?>" class="badge badge-pill badge-light border subject-pill" title="Filter by this subject">
+                                        <?= htmlspecialchars($subject_name) ?>
+                                    </a>
+                                <?php endforeach; ?>
                             <?php else: ?>
                                 <span class="text-muted">Not specified</span>
                             <?php endif; ?>
@@ -716,41 +816,59 @@ $total_pages = ceil($total_rows / $limit);
         </div>
 
         <!-- Pagination -->
-        <nav>
-            <ul class="pagination justify-content-center">
+        <?php if ($total_pages > 1): ?>
+        <nav aria-label="Page navigation">
+            <ul class="pagination justify-content-center mt-4">
                 <?php
                 // Build pagination URL that preserves all filter parameters
                 $current_params = $_GET;
-
-                // Remove page parameter if it exists
-                if (isset($current_params['page'])) {
-                    unset($current_params['page']);
-                }
-
+                
                 // Previous page link
                 if ($page > 1) {
                     $current_params['page'] = $page - 1;
                     $query_string = http_build_query($current_params);
-                    echo "<li class='page-item'><a class='page-link' href='?{$query_string}'>&laquo; Previous</a></li>";
+                    echo '<li class="page-item"><a class="page-link" href="?'.$query_string.'">&laquo; Previous</a></li>';
                 }
-
+                
                 // Page numbers
-                for ($i = 1; $i <= $total_pages; $i++) {
+                $start_page = max(1, $page - 2);
+                $end_page = min($total_pages, $page + 2);
+                
+                if ($start_page > 1) {
+                    $current_params['page'] = 1;
+                    $query_string = http_build_query($current_params);
+                    echo '<li class="page-item"><a class="page-link" href="?'.$query_string.'">1</a></li>';
+                    if ($start_page > 2) {
+                        echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
+                    }
+                }
+                
+                for ($i = $start_page; $i <= $end_page; $i++) {
                     $current_params['page'] = $i;
                     $query_string = http_build_query($current_params);
-                    $active = ($i == $page) ? "active" : "";
-                    echo "<li class='page-item $active'><a class='page-link' href='?{$query_string}'>$i</a></li>";
+                    $active = ($i == $page) ? 'active' : '';
+                    echo '<li class="page-item '.$active.'"><a class="page-link" href="?'.$query_string.'">'.$i.'</a></li>';
                 }
-
+                
+                if ($end_page < $total_pages) {
+                    if ($end_page < $total_pages - 1) {
+                        echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
+                    }
+                    $current_params['page'] = $total_pages;
+                    $query_string = http_build_query($current_params);
+                    echo '<li class="page-item"><a class="page-link" href="?'.$query_string.'">'.$total_pages.'</a></li>';
+                }
+                
                 // Next page link
                 if ($page < $total_pages) {
                     $current_params['page'] = $page + 1;
                     $query_string = http_build_query($current_params);
-                    echo "<li class='page-item'><a class='page-link' href='?{$query_string}'>Next &raquo;</a></li>";
+                    echo '<li class="page-item"><a class="page-link" href="?'.$query_string.'">Next &raquo;</a></li>';
                 }
                 ?>
             </ul>
         </nav>
+        <?php endif; ?>
     </div>
 </div>
 
@@ -787,6 +905,22 @@ $total_pages = ceil($total_rows / $limit);
             $('#tutorFilterForm').submit();
         });
     });
+</script>
+<script>
+$(document).ready(function() {
+    // Submit form when any filter changes
+    $('#tutorSearchForm select').change(function() {
+        $('#tutorSearchForm').submit();
+    });
+    
+    // Handle reset filters
+    $('.reset-filters').click(function() {
+        // Reset all form fields
+        $('#tutorSearchForm')[0].reset();
+        // Remove name search from URL
+        window.location.href = window.location.pathname;
+    });
+});
 </script>
 </body>
 </html>
