@@ -1,5 +1,6 @@
 <?php
-// profile.php - Admin profile management page
+// Include database configuration
+require_once 'config.php';
 
 // Start session
 session_start();
@@ -10,8 +11,126 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
     exit;
 }
 
-// Include database configuration
-require_once 'config.php';
+
+// Process notification creation
+$notification_msg = '';
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['create_notification'])) {
+    $subject = trim($_POST['subject']);
+    $message = trim($_POST['message']);
+    $target_type = $_POST['target_type'];
+    $important = isset($_POST['important']) ? 1 : 0;
+
+    // Validate inputs
+    if (empty($subject) || empty($message)) {
+        $notification_msg = '<div class="alert alert-danger">Please fill all required fields</div>';
+    } else {
+        // Create notification
+        $sql = "INSERT INTO notifications (subject, message, created_by, target_type, is_important) 
+                VALUES (?, ?, ?, ?, ?)";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("ssisi", $subject, $message, $admin_id, $target_type, $important);
+
+        if ($stmt->execute()) {
+            $notification_id = $stmt->insert_id;
+
+            // If specific tutors are selected
+            if ($target_type == 'specific' && isset($_POST['tutor_ids'])) {
+                foreach ($_POST['tutor_ids'] as $tutor_id) {
+                    $sql = "INSERT INTO notification_recipients (notification_id, tutor_id) VALUES (?, ?)";
+                    $stmt = $conn->prepare($sql);
+                    $stmt->bind_param("ii", $notification_id, $tutor_id);
+                    $stmt->execute();
+                }
+            }
+
+            // Log the activity
+            $activity = "Created a new notification: " . $subject;
+            $sql = "INSERT INTO admin_logs (admin_id, action, details) VALUES (?, 'create_notification', ?)";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("is", $admin_id, $activity);
+            $stmt->execute();
+
+            $notification_msg = '<div class="alert alert-success">Notification created successfully!</div>';
+        } else {
+            $notification_msg = '<div class="alert alert-danger">Error creating notification: ' . $conn->error . '</div>';
+        }
+    }
+}
+
+// Delete notification
+if (isset($_GET['delete']) && is_numeric($_GET['delete'])) {
+    $notification_id = $_GET['delete'];
+
+    // Check if notification exists and belongs to this admin
+    $sql = "SELECT id FROM notifications WHERE id = ? AND created_by = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("ii", $notification_id, $admin_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        // Delete notification recipients first
+        $sql = "DELETE FROM notification_recipients WHERE notification_id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        // Delete the notification
+        $sql = "DELETE FROM notifications WHERE id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        $notification_msg = '<div class="alert alert-success">Notification deleted successfully!</div>';
+    }
+}
+
+// Get all tutors for the dropdown
+$tutors = [];
+$sql = "SELECT id, full_name FROM tutors WHERE account_status = 'active' ORDER BY full_name";
+$result = $conn->query($sql);
+while ($row = $result->fetch_assoc()) {
+    $tutors[] = $row;
+}
+
+// Get all notifications
+$notifications = [];
+$sql = "SELECT n.*, a.username as admin_name, 
+        (SELECT COUNT(*) FROM notification_recipients WHERE notification_id = n.id) as recipient_count
+        FROM notifications n
+        JOIN admin_users a ON n.created_by = a.id
+        ORDER BY n.created_at DESC";
+$result = $conn->query($sql);
+while ($row = $result->fetch_assoc()) {
+    $notifications[] = $row;
+}
+
+// Get notification statistics
+$stats = [
+    'total' => 0,
+    'read' => 0,
+    'unread' => 0,
+    'important' => 0
+];
+
+// Total notifications
+$sql = "SELECT COUNT(*) as count FROM notifications";
+$result = $conn->query($sql);
+$stats['total'] = $result->fetch_assoc()['count'];
+
+// Important notifications
+$sql = "SELECT COUNT(*) as count FROM notifications WHERE is_important = 1";
+$result = $conn->query($sql);
+$stats['important'] = $result->fetch_assoc()['count'];
+
+// Read notifications (approximation based on read receipts)
+$sql = "SELECT COUNT(DISTINCT notification_id) as count FROM notification_read_status";
+$result = $conn->query($sql);
+$stats['read'] = $result->fetch_assoc()['count'];
+
+// Calculate unread
+$stats['unread'] = $stats['total'] - $stats['read'];
+if ($stats['unread'] < 0) $stats['unread'] = 0;
 
 // Initialize variables for profile updates
 $new_username = $new_email = $current_password = $new_password = $confirm_password = '';
@@ -19,13 +138,6 @@ $username_err = $email_err = $current_password_err = $new_password_err = $confir
 $profile_update_msg = $password_update_msg = $profile_pic_msg = '';
 $admin_id = $_SESSION['id'];
 
-// Create connection
-$conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-
-// Check connection
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
 
 // Fetch current admin information
 $stmt = $conn->prepare("SELECT username, email, full_name, profile_pic FROM admin_users WHERE id = ?");
@@ -55,7 +167,7 @@ if (isset($_POST['update_profile_pic'])) {
             } else {
                 // Create unique filename
                 $new_filename = "admin_" . $admin_id . "_" . time() . "." . $ext;
-                $upload_dir = "uploads/profile_pics/";
+                $upload_dir = "uploads/profile/";
                 
                 // Create directory if it doesn't exist
                 if (!file_exists($upload_dir)) {
@@ -275,82 +387,51 @@ $conn->close();
                         <div class="header-button-item has-noti js-item-menu">
                             <i class="zmdi zmdi-notifications"></i>
                             <div class="notifi-dropdown js-dropdown">
-                                <div class="notifi__title">
-                                    <p>You have 3 Notifications</p>
-                                </div>
+                            <div class="notifi__title">
+                                <p>You have <?= $stats['unread'] ?> Unread Notifications</p>
+                            </div>
+                            <?php foreach(array_slice($notifications, 0, 3) as $notif): ?>
                                 <div class="notifi__item">
                                     <div class="bg-c1 img-cir img-40">
                                         <i class="zmdi zmdi-email-open"></i>
                                     </div>
                                     <div class="content">
-                                        <p>You got a email notification</p>
-                                        <span class="date">April 12, 2018 06:50</span>
+                                        <p><?= htmlspecialchars($notif['subject']) ?></p>
+                                        <span class="date"><?= date('F j, Y H:i', strtotime($notif['created_at'])) ?></span>
                                     </div>
                                 </div>
-                                <div class="notifi__item">
-                                    <div class="bg-c2 img-cir img-40">
-                                        <i class="zmdi zmdi-account-box"></i>
-                                    </div>
-                                    <div class="content">
-                                        <p>Your account has been blocked</p>
-                                        <span class="date">April 12, 2018 06:50</span>
-                                    </div>
-                                </div>
-                                <div class="notifi__item">
-                                    <div class="bg-c3 img-cir img-40">
-                                        <i class="zmdi zmdi-file-text"></i>
-                                    </div>
-                                    <div class="content">
-                                        <p>You got a new file</p>
-                                        <span class="date">April 12, 2018 06:50</span>
-                                    </div>
-                                </div>
-                                <div class="notifi__footer">
-                                    <a href="#">All notifications</a>
-                                </div>
+                            <?php endforeach; ?>
+                            <div class="notifi__footer">
+                                <a href="notifications.php">All notifications</a>
                             </div>
+                        </div>
                         </div>
                         
                         <div class="account-wrap">
                             <div class="account-item account-item--style2 clearfix js-item-menu">
                                 <div class="image">
-                                <?php if (!empty($_SESSION['profile_pic']) && file_exists($_SESSION['profile_pic'])): ?>
-                                    <img src="<?= htmlspecialchars($_SESSION['profile_pic']) ?>" alt="<?= htmlspecialchars($_SESSION['tutor_name']) ?>" />
-                                <?php else: ?>
-                                    <img src="../uploads/avatar-default.jpg" alt="<?= htmlspecialchars($_SESSION['tutor_name']) ?>" />
-                                <?php endif; ?>
+                                <img src="<?php echo !empty($admin_data['profile_pic']) ? 'uploads/profile/' . htmlspecialchars($admin_data['profile_pic']) : 'uploads/profile_pics/default.png'; ?>" class="profile-pic mb-3" alt="Profile Picture">
                                 </div>
                                 <div class="content">
-                                    <a class="js-acc-btn" href="#"><?= htmlspecialchars($_SESSION['tutor_name']) ?></a>
+                                    <a class="js-acc-btn" href="#"><?= htmlspecialchars($_SESSION['full_name']) ?></a>
                                 </div>
                                 <div class="account-dropdown js-dropdown">
                                     <div class="info clearfix">
                                         <div class="image">
-                                        <?php if (!empty($_SESSION['profile_pic']) && file_exists($_SESSION['profile_pic'])): ?>
-                                            <img src="<?= htmlspecialchars($_SESSION['profile_pic']) ?>" alt="<?= htmlspecialchars($_SESSION['full_name']) ?>" />
-                                        <?php else: ?>
-                                            <img src="../uploads/avatar-default.jpg" alt="<?= htmlspecialchars($_SESSION['full_name']) ?>" />
-                                        <?php endif; ?>
+                                        <img src="<?php echo !empty($admin_data['profile_pic']) ? 'uploads/profile/' . htmlspecialchars($admin_data['profile_pic']) : 'uploads/profile_pics/default.png'; ?>" 
+                                        class="profile-pic mb-3" alt="Profile Picture">
                                         </div>
                                         <div class="content">
                                             <h5 class="name">
-                                                <a href="#"><?= htmlspecialchars($_SESSION['tutor_name']) ?></a>
+                                                <a href="#"><?= htmlspecialchars($_SESSION['full_name']) ?></a>
                                             </h5>
                                             <span class="email"><?= htmlspecialchars($_SESSION['email'] ?? '') ?></span>
                                         </div>
                                     </div>
                                     <div class="account-dropdown__body">
                                         <div class="account-dropdown__item">
-                                            <a href="profile.php?id=<?= $_SESSION['tutor_id'] ?>">
+                                            <a href="profile.php?id=<?= $_SESSION['id'] ?>">
                                                 <i class="zmdi zmdi-account"></i>Account</a>
-                                        </div>
-                                        <div class="account-dropdown__item">
-                                            <a href="#">
-                                                <i class="zmdi zmdi-settings"></i>Setting</a>
-                                        </div>
-                                        <div class="account-dropdown__item">
-                                            <a href="#">
-                                                <i class="zmdi zmdi-money-box"></i>Billing</a>
                                         </div>
                                     </div>
                                     <div class="account-dropdown__footer">
@@ -366,7 +447,7 @@ $conn->close();
         </header>
         <!-- END HEADER DESKTOP -->
          <!-- WELCOME-->
-        <section class="welcome2 p-t-40 p-b-55">
+        <section style="background-color:#0F1E8A;" class="welcome2 p-t-40 p-b-55">
             <div class="container">
                 <div class="row">
                     <div class="col-md-12">
@@ -381,6 +462,7 @@ $conn->close();
                                         <span>/</span>
                                     </li>
                                     <li class="list-inline-item"><a href="dashboard.php">Dashboard</a></li>
+                                    <li class="list-inline-item text-white">/ Manage Profile</li>
                                 </ul>
                             </div>
                         </div>
@@ -391,15 +473,9 @@ $conn->close();
                         <div class="welcome2-inner m-t-60">
                             <div class="welcome2-greeting">
                                 <h1 class="title-6">Hi
-                                    <span><?= htmlspecialchars($_SESSION['tutor_name']) ?></span>, Welcome back</h1>
+                                    <span><?= htmlspecialchars($_SESSION['full_name']) ?></span>, Welcome back</h1>
                                 <p>Administrative pages</p>
                             </div>
-                            <form class="form-header form-header2" action="" method="post">
-                                <input class="au-input au-input--w435" type="text" name="search" placeholder="Search for datas &amp; reports...">
-                                <button class="au-btn--submit" type="submit">
-                                    <i class="zmdi zmdi-search"></i>
-                                </button>
-                            </form>
                         </div>
                     </div>
                 </div>
@@ -419,18 +495,15 @@ $conn->close();
                             <aside class="menu-sidebar3 js-spe-sidebar">
                                 <nav class="navbar-sidebar2 navbar-sidebar3">
                                     <ul class="list-unstyled navbar__list">
-                                        <li class="active has-sub">
-                                            <a class="js-arrow" href="#">
+                                        <li>
+                                            <a class="js-arrow" href="dashboard.php">
                                                 <i class="fas fa-tachometer-alt"></i>Dashboard
-                                                <span class="arrow">
-                                                    <i class="fas fa-angle-down"></i>
-                                                </span>
                                             </a>
                                         </li>
                                         <li>
                                             <a href="notifications.php">
-                                                <i class="fas fa-chart-bar"></i>Inbox</a>
-                                            <span class="inbox-num">3</span>
+                                                <i class="fas fa-chart-bar"></i>Notifications</a>
+                                                <span class="inbox-num"><?= $stats['unread'] ?? '0'; ?></span>
                                         </li>
                                         <li>
                                             <a href="manage-tutors.php">
@@ -452,7 +525,7 @@ $conn->close();
                                             <a href="add-payments.php">
                                                 <i class="fas fa-user"></i>Manage Subjects</a>
                                         </li>
-                                        <li>
+                                        <li class="active has-sub">
                                             <a href="profile.php">
                                                 <i class="fas fa-lock"></i>Reset Password</a>
                                         </li>
@@ -480,7 +553,7 @@ $conn->close();
                                                     
                                                     <div class="row">
                                                         <div class="col-md-3 text-center">
-                                                            <img src="<?php echo !empty($admin_data['profile_pic']) ? 'uploads/profile_pics/' . htmlspecialchars($admin_data['profile_pic']) : 'uploads/profile_pics/default.png'; ?>" 
+                                                            <img src="<?php echo !empty($admin_data['profile_pic']) ? 'uploads/profile/' . htmlspecialchars($admin_data['profile_pic']) : 'uploads/profile_pics/default.png'; ?>" 
                                                                 class="profile-pic mb-3" alt="Profile Picture">
                                                         </div>
                                                         <div class="col-md-9">
@@ -533,12 +606,7 @@ $conn->close();
                                         <div class="row">
                                     <div class="col-lg-12">
                                         <div class="au-card au-card--no-shadow au-card--no-pad m-b-40 au-card--border">
-                                            <div class="au-card-title">
-                                                                                                   
-                                                <button class="au-btn-plus">
-                                                    <i class="zmdi zmdi-plus"></i>
-                                                </button>
-                                            </div>
+                                    
                                             <div class="recent-report3 m-b-40">
                                                     <!-- Change Password Section -->
                                                     <div class="profile-section">

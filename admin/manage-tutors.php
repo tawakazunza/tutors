@@ -11,6 +11,87 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
 // Include database configuration
 require_once 'config.php';
 
+// Process notification creation
+$notification_msg = '';
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['create_notification'])) {
+    $subject = trim($_POST['subject']);
+    $message = trim($_POST['message']);
+    $target_type = $_POST['target_type'];
+    $important = isset($_POST['important']) ? 1 : 0;
+
+    // Validate inputs
+    if (empty($subject) || empty($message)) {
+        $notification_msg = '<div class="alert alert-danger">Please fill all required fields</div>';
+    } else {
+        // Create notification
+        $sql = "INSERT INTO notifications (subject, message, created_by, target_type, is_important) 
+                VALUES (?, ?, ?, ?, ?)";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("ssisi", $subject, $message, $admin_id, $target_type, $important);
+
+        if ($stmt->execute()) {
+            $notification_id = $stmt->insert_id;
+
+            // If specific tutors are selected
+            if ($target_type == 'specific' && isset($_POST['tutor_ids'])) {
+                foreach ($_POST['tutor_ids'] as $tutor_id) {
+                    $sql = "INSERT INTO notification_recipients (notification_id, tutor_id) VALUES (?, ?)";
+                    $stmt = $conn->prepare($sql);
+                    $stmt->bind_param("ii", $notification_id, $tutor_id);
+                    $stmt->execute();
+                }
+            }
+
+            // Log the activity
+            $activity = "Created a new notification: " . $subject;
+            $sql = "INSERT INTO admin_logs (admin_id, action, details) VALUES (?, 'create_notification', ?)";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("is", $admin_id, $activity);
+            $stmt->execute();
+
+            $notification_msg = '<div class="alert alert-success">Notification created successfully!</div>';
+        } else {
+            $notification_msg = '<div class="alert alert-danger">Error creating notification: ' . $conn->error . '</div>';
+        }
+    }
+}
+
+// Delete notification
+if (isset($_GET['delete']) && is_numeric($_GET['delete'])) {
+    $notification_id = $_GET['delete'];
+
+    // Check if notification exists and belongs to this admin
+    $sql = "SELECT id FROM notifications WHERE id = ? AND created_by = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("ii", $notification_id, $admin_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        // Delete notification recipients first
+        $sql = "DELETE FROM notification_recipients WHERE notification_id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        // Delete the notification
+        $sql = "DELETE FROM notifications WHERE id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        $notification_msg = '<div class="alert alert-success">Notification deleted successfully!</div>';
+    }
+}
+
+// Get all tutors for the dropdown
+$tutors = [];
+$sql = "SELECT id, full_name FROM tutors WHERE account_status = 'active' ORDER BY full_name";
+$result = $conn->query($sql);
+while ($row = $result->fetch_assoc()) {
+    $tutors[] = $row;
+}
+
 // Get all notifications
 $notifications = [];
 $sql = "SELECT n.*, a.username as admin_name, 
@@ -337,7 +418,7 @@ $result = $stmt->get_result();
                         <i class="zmdi zmdi-notifications"></i>
                         <div class="notifi-dropdown js-dropdown">
                             <div class="notifi__title">
-                                <p>You have <?= $stats['unread'] ?> Unread Notifications</p>
+                                <p>You have <?= $stats['unread'] ?? '0'; ?> Unread Notifications</p>
                             </div>
                             <?php foreach(array_slice($notifications, 0, 3) as $notif): ?>
                                 <div class="notifi__item">
@@ -456,8 +537,8 @@ $result = $stmt->get_result();
                                     </li>
                                     <li>
                                         <a href="notifications.php">
-                                            <i class="fas fa-bell"></i>Notifications</a>
-                                            <h2 class="stat-value mb-0"><?= $stats['total'] ?? 0; ?></h2>
+                                            <i class="fas fa-chart-bar"></i>Notifications</a>
+                                            <span class="inbox-num"><?= $stats['unread'] ?? '0'; ?></span>
                                     </li>
                                     <li class="active has-sub">
                                         <a href="manage-tutors.php">
@@ -594,9 +675,7 @@ $result = $stmt->get_result();
                                                                         </button>
                                                                     </form>
 
-                                                                    <a href="view-tutor.php?id=<?php echo $row['id']; ?>" class="btn btn-info btn-sm action-btn" title="View Details">
-                                                                        <i class="fa fa-eye"></i>
-                                                                    </a>
+                                                    
                                                                 </div>
                                                             </td>
                                                         </tr>

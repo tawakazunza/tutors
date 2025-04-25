@@ -1,5 +1,6 @@
 <?php
-// cities.php - Admin city management page
+// Include database configuration
+require_once 'config.php';
 
 // Start session
 session_start();
@@ -9,9 +10,27 @@ if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
     header("location: login.php");
     exit;
 }
+$admin_id = $_SESSION['id'];
 
-// Include database configuration
-require_once 'config.php';
+// Get admin profile picture
+$sql = "SELECT profile_pic, full_name, email FROM admin_users WHERE id = ?";
+$stmt = $conn->prepare($sql);
+$stmt->bind_param("i", $admin_id);
+$stmt->execute();
+$result = $stmt->get_result();
+
+$profile_picture = "uploads/profile/avatar-default.jpg"; // Default image
+$admin_data = $result->fetch_assoc();
+
+if ($admin_data) {
+    if (!empty($admin_data['profile_pic'])) {
+        $profile_picture = "uploads/profile/" . htmlspecialchars($admin_data['profile_pic']);
+    }
+    $_SESSION['full_name'] = $admin_data['full_name'] ?? $_SESSION['username'];
+    $_SESSION['email'] = $admin_data['email'] ?? '';
+}
+
+
 
 // Initialize variables
 $city_name = "";
@@ -19,13 +38,126 @@ $city_name_err = "";
 $success_message = "";
 $error_message = "";
 
-// Create connection
-$conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
+// Process notification creation
+$notification_msg = '';
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['create_notification'])) {
+    $subject = trim($_POST['subject']);
+    $message = trim($_POST['message']);
+    $target_type = $_POST['target_type'];
+    $important = isset($_POST['important']) ? 1 : 0;
 
-// Check connection
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
+    // Validate inputs
+    if (empty($subject) || empty($message)) {
+        $notification_msg = '<div class="alert alert-danger">Please fill all required fields</div>';
+    } else {
+        // Create notification
+        $sql = "INSERT INTO notifications (subject, message, created_by, target_type, is_important) 
+                VALUES (?, ?, ?, ?, ?)";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("ssisi", $subject, $message, $admin_id, $target_type, $important);
+
+        if ($stmt->execute()) {
+            $notification_id = $stmt->insert_id;
+
+            // If specific tutors are selected
+            if ($target_type == 'specific' && isset($_POST['tutor_ids'])) {
+                foreach ($_POST['tutor_ids'] as $tutor_id) {
+                    $sql = "INSERT INTO notification_recipients (notification_id, tutor_id) VALUES (?, ?)";
+                    $stmt = $conn->prepare($sql);
+                    $stmt->bind_param("ii", $notification_id, $tutor_id);
+                    $stmt->execute();
+                }
+            }
+
+            // Log the activity
+            $activity = "Created a new notification: " . $subject;
+            $sql = "INSERT INTO admin_logs (admin_id, action, details) VALUES (?, 'create_notification', ?)";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("is", $admin_id, $activity);
+            $stmt->execute();
+
+            $notification_msg = '<div class="alert alert-success">Notification created successfully!</div>';
+        } else {
+            $notification_msg = '<div class="alert alert-danger">Error creating notification: ' . $conn->error . '</div>';
+        }
+    }
 }
+
+// Delete notification
+if (isset($_GET['delete']) && is_numeric($_GET['delete'])) {
+    $notification_id = $_GET['delete'];
+
+    // Check if notification exists and belongs to this admin
+    $sql = "SELECT id FROM notifications WHERE id = ? AND created_by = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("ii", $notification_id, $admin_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows > 0) {
+        // Delete notification recipients first
+        $sql = "DELETE FROM notification_recipients WHERE notification_id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        // Delete the notification
+        $sql = "DELETE FROM notifications WHERE id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $notification_id);
+        $stmt->execute();
+
+        $notification_msg = '<div class="alert alert-success">Notification deleted successfully!</div>';
+    }
+}
+
+// Get all tutors for the dropdown
+$tutors = [];
+$sql = "SELECT id, full_name FROM tutors WHERE account_status = 'active' ORDER BY full_name";
+$result = $conn->query($sql);
+while ($row = $result->fetch_assoc()) {
+    $tutors[] = $row;
+}
+
+// Get all notifications
+$notifications = [];
+$sql = "SELECT n.*, a.username as admin_name, 
+        (SELECT COUNT(*) FROM notification_recipients WHERE notification_id = n.id) as recipient_count
+        FROM notifications n
+        JOIN admin_users a ON n.created_by = a.id
+        ORDER BY n.created_at DESC";
+$result = $conn->query($sql);
+while ($row = $result->fetch_assoc()) {
+    $notifications[] = $row;
+}
+
+// Get notification statistics
+$stats = [
+    'total' => 0,
+    'read' => 0,
+    'unread' => 0,
+    'important' => 0
+];
+
+// Total notifications
+$sql = "SELECT COUNT(*) as count FROM notifications";
+$result = $conn->query($sql);
+$stats['total'] = $result->fetch_assoc()['count'];
+
+// Important notifications
+$sql = "SELECT COUNT(*) as count FROM notifications WHERE is_important = 1";
+$result = $conn->query($sql);
+$stats['important'] = $result->fetch_assoc()['count'];
+
+// Read notifications (approximation based on read receipts)
+$sql = "SELECT COUNT(DISTINCT notification_id) as count FROM notification_read_status";
+$result = $conn->query($sql);
+$stats['read'] = $result->fetch_assoc()['count'];
+
+// Calculate unread
+$stats['unread'] = $stats['total'] - $stats['read'];
+if ($stats['unread'] < 0) $stats['unread'] = 0;
+
 
 // Process form data when submitted
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
@@ -135,16 +267,30 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     }
 }
 
-// Fetch all cities for display
-$cities = array();
-$sql = "SELECT id, name FROM subjects ORDER BY name ASC";
-$result = $conn->query($sql);
+// Pagination Configuration
+$records_per_page = 10;
+$page = isset($_GET['page']) ? intval($_GET['page']) : 1;
+$offset = ($page - 1) * $records_per_page;
 
-if ($result) {
-    while ($row = $result->fetch_assoc()) {
-        $cities[] = $row;
+// Count total number of subjects
+$total_records_sql = "SELECT COUNT(*) FROM subjects";
+$total_result = $conn->query($total_records_sql);
+$total_records = $total_result->fetch_row()[0];
+$total_pages = ceil($total_records / $records_per_page);
+
+// Fetch subjects for current page
+$cities = array();
+$sql = "SELECT id, name FROM subjects ORDER BY name ASC LIMIT ? OFFSET ?";
+if ($stmt = $conn->prepare($sql)) {
+    $stmt->bind_param("ii", $records_per_page, $offset);
+    
+    if ($stmt->execute()) {
+        $result = $stmt->get_result();
+        while ($row = $result->fetch_assoc()) {
+            $cities[] = $row;
+        }
     }
-    $result->free();
+    $stmt->close();
 }
 
 $conn->close();
@@ -201,73 +347,49 @@ $conn->close();
                         <div class="header-button-item has-noti js-item-menu">
                             <i class="zmdi zmdi-notifications"></i>
                             <div class="notifi-dropdown js-dropdown">
-                                <div class="notifi__title">
-                                    <p>You have 3 Notifications</p>
-                                </div>
+                            <div class="notifi__title">
+                                <p>You have <?= $stats['unread'] ?> Unread Notifications</p>
+                            </div>
+                            <?php foreach(array_slice($notifications, 0, 3) as $notif): ?>
                                 <div class="notifi__item">
                                     <div class="bg-c1 img-cir img-40">
                                         <i class="zmdi zmdi-email-open"></i>
                                     </div>
                                     <div class="content">
-                                        <p>You got a email notification</p>
-                                        <span class="date">April 12, 2018 06:50</span>
+                                        <p><?= htmlspecialchars($notif['subject']) ?></p>
+                                        <span class="date"><?= date('F j, Y H:i', strtotime($notif['created_at'])) ?></span>
                                     </div>
                                 </div>
-                                <div class="notifi__item">
-                                    <div class="bg-c2 img-cir img-40">
-                                        <i class="zmdi zmdi-account-box"></i>
-                                    </div>
-                                    <div class="content">
-                                        <p>Your account has been blocked</p>
-                                        <span class="date">April 12, 2018 06:50</span>
-                                    </div>
-                                </div>
-                                <div class="notifi__item">
-                                    <div class="bg-c3 img-cir img-40">
-                                        <i class="zmdi zmdi-file-text"></i>
-                                    </div>
-                                    <div class="content">
-                                        <p>You got a new file</p>
-                                        <span class="date">April 12, 2018 06:50</span>
-                                    </div>
-                                </div>
-                                <div class="notifi__footer">
-                                    <a href="#">All notifications</a>
-                                </div>
+                            <?php endforeach; ?>
+                            <div class="notifi__footer">
+                                <a href="notifications.php">All notifications</a>
                             </div>
+                        </div>
                         </div>
                         
                         <div class="account-wrap">
                             <div class="account-item account-item--style2 clearfix js-item-menu">
                                 <div class="image">
-                                <?php if (!empty($_SESSION['profile_pic']) && file_exists($_SESSION['profile_pic'])): ?>
-                                    <img src="<?= htmlspecialchars($_SESSION['profile_pic']) ?>" alt="<?= htmlspecialchars($_SESSION['tutor_name']) ?>" />
-                                <?php else: ?>
-                                    <img src="../uploads/avatar-default.jpg" alt="<?= htmlspecialchars($_SESSION['tutor_name']) ?>" />
-                                <?php endif; ?>
+                                    <img src="<?= $profile_picture ?>" alt="Profile Picture" style="width: 50px; height: 50px; object-fit: cover; border-radius: 50%;">
                                 </div>
                                 <div class="content">
-                                    <a class="js-acc-btn" href="#"><?= htmlspecialchars($_SESSION['tutor_name']) ?></a>
+                                    <a class="js-acc-btn" href="#"><?= htmlspecialchars($_SESSION['full_name']) ?></a>
                                 </div>
                                 <div class="account-dropdown js-dropdown">
                                     <div class="info clearfix">
-                                        <div class="image">
-                                        <?php if (!empty($_SESSION['profile_pic']) && file_exists($_SESSION['profile_pic'])): ?>
-                                            <img src="<?= htmlspecialchars($_SESSION['profile_pic']) ?>" alt="<?= htmlspecialchars($_SESSION['full_name']) ?>" />
-                                        <?php else: ?>
-                                            <img src="../uploads/avatar-default.jpg" alt="<?= htmlspecialchars($_SESSION['full_name']) ?>" />
-                                        <?php endif; ?>
-                                        </div>
+                                    <div class="image">
+                                        <img src="<?= $profile_picture ?>" alt="Profile Picture" style="width: 50px; height: 50px; object-fit: cover; border-radius: 50%;">
+                                    </div>
                                         <div class="content">
                                             <h5 class="name">
-                                                <a href="#"><?= htmlspecialchars($_SESSION['tutor_name']) ?></a>
+                                                <a href="#"><?= htmlspecialchars($_SESSION['full_name']) ?></a>
                                             </h5>
                                             <span class="email"><?= htmlspecialchars($_SESSION['email'] ?? '') ?></span>
                                         </div>
                                     </div>
                                     <div class="account-dropdown__body">
                                         <div class="account-dropdown__item">
-                                            <a href="profile.php?id=<?= $_SESSION['tutor_id'] ?>">
+                                            <a href="profile.php?id=<?= $_SESSION['id'] ?>">
                                                 <i class="zmdi zmdi-account"></i>Account</a>
                                         </div>
                                         <div class="account-dropdown__item">
@@ -292,7 +414,7 @@ $conn->close();
         </header>
         <!-- END HEADER DESKTOP -->
          <!-- WELCOME-->
-        <section class="welcome2 p-t-40 p-b-55">
+        <section style="background-color:#0F1E8A;" class="welcome2 p-t-40 p-b-55">
             <div class="container">
                 <div class="row">
                     <div class="col-md-12">
@@ -307,6 +429,7 @@ $conn->close();
                                         <span>/</span>
                                     </li>
                                     <li class="list-inline-item"><a href="dashboard.php">Dashboard</a></li>
+                                    <li class="list-inline-item text-white">/ Manage Subjects</li>
                                 </ul>
                             </div>
                         </div>
@@ -317,15 +440,9 @@ $conn->close();
                         <div class="welcome2-inner m-t-60">
                             <div class="welcome2-greeting">
                                 <h1 class="title-6">Hi
-                                    <span><?= htmlspecialchars($_SESSION['tutor_name']) ?></span>, Welcome back</h1>
-                                <p>Administrative pages</p>
+                                    <span><?= htmlspecialchars($_SESSION['full_name']) ?></span>, Welcome back</h1>
+                                <p>Administrative pages | Manage Subjects</p>
                             </div>
-                            <form class="form-header form-header2" action="" method="post">
-                                <input class="au-input au-input--w435" type="text" name="search" placeholder="Search for datas &amp; reports...">
-                                <button class="au-btn--submit" type="submit">
-                                    <i class="zmdi zmdi-search"></i>
-                                </button>
-                            </form>
                         </div>
                     </div>
                 </div>
@@ -365,8 +482,9 @@ $conn->close();
                                         </li>
                                         <li>
                                             <a href="notifications.php">
-                                                <i class="fas fa-chart-bar"></i>Inbox</a>
-                                            <span class="inbox-num">3</span>
+                                                <i class="fas fa-chart-bar"></i>Notifications
+                                            </a>
+                                                <span class="inbox-num"><?= $stats['unread'] ?></span>
                                         </li>
                                         <li>
                                             <a href="manage-tutors.php">
@@ -403,19 +521,19 @@ $conn->close();
                                 <div class="row">
                                     <div class="col-lg-12">
                                         <!-- RECENT REPORT-->
-                                        <div class="recent-report3 m-b-40">
-                                            <div class="title-wrap">
-                                            <h2>Subjects Management</h2>
-                                                    <p>Add, edit, or remove subjects from the database</p>
+                                        <div class="card m-b-40">
+                                            <div style="background-color:#0F1E8A;" class="card-header">
+                                            <h2 class="text-white">Subjects Management</h2>
+                                                    <p class="text-white">Add, edit, or remove subjects from the database</p>
                                             </div>
                                             
-                                            <div class="chart-wrap">
+                                            <div class="card-body">
                                                 <!-- Add City Form -->
                                                 <div class="form-section">
                                                     <h4>Add New Subject</h4>
                                                     <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post" class="row g-3">
                                                         <div class="col-md-6">
-                                                            <label for="city_name" class="form-label">Payment Method</label>
+                                                            <label for="city_name" class="form-label">Subject</label>
                                                             <input type="text" class="form-control <?php echo (!empty($city_name_err)) ? 'is-invalid' : ''; ?>" 
                                                                 id="city_name" name="subjects" value="<?php echo htmlspecialchars($city_name); ?>">
                                                             <span class="invalid-feedback"><?php echo $city_name_err; ?></span>
@@ -436,7 +554,7 @@ $conn->close();
                                         <?php if(count($cities) > 0): ?>
                                         <div class="table-responsive m-b-40">
                                             <table class="table table-borderless table-data3">
-                                                <thead>
+                                                <thead style="background-color:#0F1E8A;">
                                                     <tr>
                                                     <th>ID</th>
                                                     <th>Subject</th>
@@ -467,6 +585,58 @@ $conn->close();
                                                 </tbody>
                                             </table>
                                         </div>
+                                        <!-- Pagination -->
+                                        <div class="pagination-container">
+                                            <nav aria-label="Page navigation">
+                                                <ul class="pagination justify-content-center">
+                                                    <!-- Previous Page Link -->
+                                                    <li class="page-item <?php echo ($page <= 1) ? 'disabled' : ''; ?>">
+                                                        <a class="page-link" href="<?php echo ($page <= 1) ? '#' : htmlspecialchars($_SERVER["PHP_SELF"]) . '?page=' . ($page - 1); ?>" aria-label="Previous">
+                                                            <span aria-hidden="true"><i class="fas fa-angle-left"></i></span>
+                                                        </a>
+                                                    </li>
+                                                    
+                                                    <!-- Page Numbers -->
+                                                    <?php 
+                                                    // Calculate range of pages to show
+                                                    $start_page = max(1, $page - 2);
+                                                    $end_page = min($total_pages, $page + 2);
+                                                    
+                                                    // Always show first page
+                                                    if ($start_page > 1) {
+                                                        echo '<li class="page-item"><a class="page-link" href="' . htmlspecialchars($_SERVER["PHP_SELF"]) . '?page=1">1</a></li>';
+                                                        if ($start_page > 2) {
+                                                            echo '<li class="page-item disabled"><a class="page-link">...</a></li>';
+                                                        }
+                                                    }
+                                                    
+                                                    // Show page numbers
+                                                    for ($i = $start_page; $i <= $end_page; $i++) {
+                                                        echo '<li class="page-item ' . ($i == $page ? 'active' : '') . '"><a class="page-link" href="' . htmlspecialchars($_SERVER["PHP_SELF"]) . '?page=' . $i . '">' . $i . '</a></li>';
+                                                    }
+                                                    
+                                                    // Always show last page
+                                                    if ($end_page < $total_pages) {
+                                                        if ($end_page < $total_pages - 1) {
+                                                            echo '<li class="page-item disabled"><a class="page-link">...</a></li>';
+                                                        }
+                                                        echo '<li class="page-item"><a class="page-link" href="' . htmlspecialchars($_SERVER["PHP_SELF"]) . '?page=' . $total_pages . '">' . $total_pages . '</a></li>';
+                                                    }
+                                                    ?>
+                                                    
+                                                    <!-- Next Page Link -->
+                                                    <li class="page-item <?php echo ($page >= $total_pages) ? 'disabled' : ''; ?>">
+                                                        <a class="page-link" href="<?php echo ($page >= $total_pages) ? '#' : htmlspecialchars($_SERVER["PHP_SELF"]) . '?page=' . ($page + 1); ?>" aria-label="Next">
+                                                            <span aria-hidden="true"><i class="fas fa-angle-right"></i></span>
+                                                        </a>
+                                                    </li>
+                                                </ul>
+                                            </nav>
+                                            <div class="pagination-info text-center mt-2">
+                                                Showing <?php echo ($offset + 1); ?> to <?php echo min($offset + $records_per_page, $total_records); ?> of <?php echo $total_records; ?> subjects
+                                            </div>
+                                        </div>
+                                        <!-- END Pagination -->
                                             <?php else: ?>
                                                 <div class="alert alert-info">No soubject found. Add a new subject above.</div>
                                             <?php endif; ?>

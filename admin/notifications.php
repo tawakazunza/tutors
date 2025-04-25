@@ -3,7 +3,7 @@
 require_once 'config.php';
 // Start session
 session_start();
-// notifications.php - Admin notification management system
+
 // Check if user is logged in
 if (!isset($_SESSION['loggedin']) || $_SESSION['loggedin'] !== true) {
     header("location: login.php");
