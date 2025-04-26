@@ -10,6 +10,149 @@ if (!isset($_SESSION['tutor_id'])) {
 $tutor_id = $_SESSION['tutor_id'];
 $success = $error = "";
 
+// Mark notification as read
+if (isset($_GET['mark_read']) && is_numeric($_GET['mark_read'])) {
+    $notification_id = $_GET['mark_read'];
+    
+    // Check if this notification applies to this tutor
+    $notification = getNotification($conn, $notification_id, $tutor_id);
+    
+    if ($notification) {
+        // Check if already marked as read
+        $sql = "SELECT id FROM notification_read_status WHERE notification_id = ? AND tutor_id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("ii", $notification_id, $tutor_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if ($result->num_rows === 0) {
+            // Not marked as read yet, so mark it
+            $sql = "INSERT INTO notification_read_status (notification_id, tutor_id) VALUES (?, ?)";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("ii", $notification_id, $tutor_id);
+            $stmt->execute();
+        }
+        
+        // Redirect to avoid resubmission
+        header("location: tutor-notifications.php");
+        exit;
+    }
+}
+
+// Get all notifications applicable to this tutor
+$notifications = [];
+
+// Get notifications targeted to all tutors
+$sql = "SELECT n.*, a.username as admin_name, nrs.read_at
+        FROM notifications n
+        JOIN admin_users a ON n.created_by = a.id
+        LEFT JOIN notification_read_status nrs ON n.id = nrs.notification_id AND nrs.tutor_id = ?
+        WHERE n.target_type = 'all'";
+
+$stmt = $conn->prepare($sql);
+$stmt->bind_param("i", $tutor_id);
+$stmt->execute();
+$result = $stmt->get_result();
+
+while ($row = $result->fetch_assoc()) {
+    $row['is_read'] = !is_null($row['read_at']);
+    $notifications[] = $row;
+}
+
+// Get notifications targeted to active tutors
+$sql = "SELECT n.*, a.username as admin_name, nrs.read_at
+        FROM notifications n
+        JOIN admin_users a ON n.created_by = a.id
+        LEFT JOIN notification_read_status nrs ON n.id = nrs.notification_id AND nrs.tutor_id = ?
+        JOIN tutors t ON t.id = ?
+        WHERE n.target_type = 'active' AND t.account_status = 'active'";
+
+$stmt = $conn->prepare($sql);
+$stmt->bind_param("ii", $tutor_id, $tutor_id);
+$stmt->execute();
+$result = $stmt->get_result();
+
+while ($row = $result->fetch_assoc()) {
+    $row['is_read'] = !is_null($row['read_at']);
+    $notifications[] = $row;
+}
+
+// Get notifications specifically targeted to this tutor
+$sql = "SELECT n.*, a.username as admin_name, nrs.read_at
+        FROM notifications n
+        JOIN admin_users a ON n.created_by = a.id
+        JOIN notification_recipients nr ON n.id = nr.notification_id
+        LEFT JOIN notification_read_status nrs ON n.id = nrs.notification_id AND nrs.tutor_id = ?
+        WHERE n.target_type = 'specific' AND nr.tutor_id = ?";
+
+$stmt = $conn->prepare($sql);
+$stmt->bind_param("ii", $tutor_id, $tutor_id);
+$stmt->execute();
+$result = $stmt->get_result();
+
+while ($row = $result->fetch_assoc()) {
+    $row['is_read'] = !is_null($row['read_at']);
+    $notifications[] = $row;
+}
+
+// Sort notifications by created_at (newest first)
+usort($notifications, function($a, $b) {
+    return strtotime($b['created_at']) - strtotime($a['created_at']);
+});
+
+// Count unread notifications
+$unread_count = 0;
+foreach ($notifications as $notification) {
+    if (!$notification['is_read']) {
+        $unread_count++;
+    }
+}
+
+// Helper function to check if a notification applies to this tutor
+function getNotification($conn, $notification_id, $tutor_id) {
+    // First check if the notification exists
+    $sql = "SELECT target_type FROM notifications WHERE id = ?";
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("i", $notification_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    if ($result->num_rows === 0) {
+        return null;
+    }
+    
+    $notification = $result->fetch_assoc();
+    
+    // Check if this notification applies to this tutor
+    if ($notification['target_type'] == 'all') {
+        return $notification;
+    } else if ($notification['target_type'] == 'active') {
+        // Check if tutor is active
+        $sql = "SELECT id FROM tutors WHERE id = ? AND account_status = 'active'";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("i", $tutor_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if ($result->num_rows > 0) {
+            return $notification;
+        }
+    } else if ($notification['target_type'] == 'specific') {
+        // Check if tutor is in recipients
+        $sql = "SELECT id FROM notification_recipients WHERE notification_id = ? AND tutor_id = ?";
+        $stmt = $conn->prepare($sql);
+        $stmt->bind_param("ii", $notification_id, $tutor_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if ($result->num_rows > 0) {
+            return $notification;
+        }
+    }
+    
+    return null;
+}
+
 // Fetch dropdown options
 $cities = $conn->query("SELECT id, name FROM cities");
 $subjects = $conn->query("SELECT id, name FROM subjects");
@@ -186,6 +329,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <!-- Main CSS-->
     <link href="css/theme.css" rel="stylesheet" media="all">
+    <style>
+        .notification-item {
+            border-left: 4px solid #e9ecef;
+            transition: all 0.2s ease;
+        }
+        .notification-item:hover {
+            background-color: #f8f9fa;
+        }
+        .notification-item.unread {
+            border-left: 4px solid #0F1E8A;
+            background-color: rgba(15, 30, 138, 0.05);
+        }
+        .notification-item.important {
+            border-left: 4px solid #dc3545;
+        }
+        .notification-date {
+            font-size: 0.8rem;
+            color: #6c757d;
+        }
+        .notification-badge {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background: #dc3545;
+            color: white;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+        }
+    </style>
 
 </head>
 <body class="animsition">
@@ -201,42 +378,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 <div class="header__tool">
                     <div class="header-button-item has-noti js-item-menu">
-                        <i class="zmdi zmdi-notifications"></i>
-                        <div class="notifi-dropdown js-dropdown">
-                            <div class="notifi__title">
-                                <p>You have 3 Notifications</p>
-                            </div>
-                            <div class="notifi__item">
-                                <div class="bg-c1 img-cir img-40">
-                                    <i class="zmdi zmdi-email-open"></i>
-                                </div>
-                                <div class="content">
-                                    <p>You got a email notification</p>
-                                    <span class="date">April 12, 2018 06:50</span>
-                                </div>
-                            </div>
-                            <div class="notifi__item">
-                                <div class="bg-c2 img-cir img-40">
-                                    <i class="zmdi zmdi-account-box"></i>
-                                </div>
-                                <div class="content">
-                                    <p>Your account has been blocked</p>
-                                    <span class="date">April 12, 2018 06:50</span>
-                                </div>
-                            </div>
-                            <div class="notifi__item">
-                                <div class="bg-c3 img-cir img-40">
-                                    <i class="zmdi zmdi-file-text"></i>
-                                </div>
-                                <div class="content">
-                                    <p>You got a new file</p>
-                                    <span class="date">April 12, 2018 06:50</span>
-                                </div>
-                            </div>
-                            <div class="notifi__footer">
-                                <a href="#">All notifications</a>
-                            </div>
-                        </div>
+                        <a href="notifications.php"><i class="zmdi zmdi-notifications"></i></a>
+                        <span class="notification-badge"><?= $unread_count ?></span>
                     </div>
                     <div class="account-wrap">
                         <div class="account-item account-item--style2 clearfix js-item-menu">
@@ -264,14 +407,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <div class="account-dropdown__item">
                                         <a href="profile.php?id=<?= $_SESSION['tutor_id'] ?>">
                                             <i class="zmdi zmdi-account"></i>Account</a>
-                                    </div>
-                                    <div class="account-dropdown__item">
-                                        <a href="#">
-                                            <i class="zmdi zmdi-settings"></i>Setting</a>
-                                    </div>
-                                    <div class="account-dropdown__item">
-                                        <a href="#">
-                                            <i class="zmdi zmdi-money-box"></i>Billing</a>
                                     </div>
                                 </div>
                                 <div class="account-dropdown__footer">
@@ -357,9 +492,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                             </a>
                                         </li>
                                         <li>
-                                            <a href="inbox.php">
-                                                <i class="fas fa-chart-bar"></i>Inbox</a>
-                                            <span class="inbox-num">3</span>
+                                            <a href="notifications.php">
+                                            <i class="fas fa-chart-bar"></i>Notifications</a>
+                                            <span class="notification-badge"><?= $unread_count ?></span>
                                         </li>
                                         <li>
                                             <a href="reviews.php">

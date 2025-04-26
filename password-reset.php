@@ -2,46 +2,57 @@
 session_start();
 include 'config.php';
 
-$error = "";
+$error = $success = '';
+$token = $_GET['token'] ?? '';
 
-// Handle form submission
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $email = trim($_POST['email']);
-    $password = $_POST['password'];
-
-    if (empty($email) || empty($password)) {
-        $error = "Please fill in all fields.";
+// Verify token
+if (!empty($token)) {
+    $stmt = $conn->prepare("SELECT id, reset_token_expiry FROM tutors WHERE reset_token = ?");
+    $stmt->bind_param("s", $token);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    if ($result->num_rows === 1) {
+        $tutor = $result->fetch_assoc();
+        $now = date("Y-m-d H:i:s");
+        
+        if ($tutor['reset_token_expiry'] < $now) {
+            $error = "This reset link has expired. Please request a new one.";
+            $token = ''; // Invalidate token
+        }
     } else {
-        // Modified query to include account_status
-        $stmt = $conn->prepare("SELECT id, full_name, password, account_status FROM tutors WHERE email = ?");
-        $stmt->bind_param("s", $email);
-        $stmt->execute();
-        $res = $stmt->get_result();
+        $error = "Invalid reset link. Please request a new one.";
+        $token = ''; // Invalidate token
+    }
+}
 
-        if ($res->num_rows === 1) {
-            $tutor = $res->fetch_assoc();
-
-            if (password_verify($password, $tutor['password'])) {
-                // Check account status before allowing login
-                if ($tutor['account_status'] !== 'active') {
-                    $error = "Your account is currently suspended. Please contact admin for assistance.";
-                } else {
-                    // Login success
-                    $_SESSION['tutor_id'] = $tutor['id'];
-                    $_SESSION['tutor_name'] = $tutor['full_name'];
-                    header("Location: dashboard.php");
-                    exit;
-                }
-            } else {
-                $error = "Incorrect password.";
-            }
+// Handle password reset
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($token)) {
+    $password = $_POST['password'];
+    $confirm_password = $_POST['confirm_password'];
+    
+    if (empty($password) || empty($confirm_password)) {
+        $error = "Please fill in all fields";
+    } elseif ($password !== $confirm_password) {
+        $error = "Passwords do not match";
+    } elseif (strlen($password) < 8) {
+        $error = "Password must be at least 8 characters";
+    } else {
+        // Update password and clear token
+        $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+        $null = null;
+        
+        $update = $conn->prepare("UPDATE tutors SET password = ?, reset_token = ?, reset_token_expiry = ? WHERE reset_token = ?");
+        $update->bind_param("ssss", $hashed_password, $null, $null, $token);
+        
+        if ($update->execute()) {
+            $success = "Password updated successfully! You can now <a href='login.php'>login</a>.";
         } else {
-            $error = "No tutor found with that email.";
+            $error = "Failed to update password. Please try again.";
         }
     }
 }
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 
@@ -92,53 +103,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </a>
                         </div>
                         <div class="login-form">
-                        <?php if (!empty($error)): ?>
-                                  <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
-                        <?php endif; ?>
-
-                    <form method="POST" action="">
-                      <div class="mb-3">
-                                  <label>Email Address</label>
-                                  <input type="email" name="email" class="form-control" required value="<?= isset($email) ? htmlspecialchars($email) : '' ?>">
-                              </div>
-
-                              <div class="mb-3">
-                                  <label>Password</label>
-                                  <input type="password" name="password" class="form-control" required>
-                      </div>
-
-                      <div class="form-check form-switch d-flex align-items-center mb-3">
-                        <input class="form-check-input" type="checkbox" id="rememberMe" checked>
-                        <label class="form-check-label mb-0 ms-3" for="rememberMe">Remember me</label>
-                      </div>
-                      <button type="submit" class="btn btn-primary w-100">Login</button>
-                      <a href="reset-request.php" class="btn btn-danger w-100 mt-4">Reset Password</a>
-                </form>
-                <div class="register-link">
-                                <p>
-                                    Don't you have account?
-                                    <a href="register.php">Sign Up Here</a>
-                                </p>
-                            </div>
+                            <?php if (!empty($error)): ?>
+                                <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($success)): ?>
+                                <div class="alert alert-success"><?= $success ?></div>
+                            <?php endif; ?>
+                            
+                            <?php if (!empty($token)): ?>
+                                <form method="POST" action="">
+                                    <div class="mb-3">
+                                        <label>New Password</label>
+                                        <input type="password" name="password" class="form-control" required minlength="8">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label>Confirm New Password</label>
+                                        <input type="password" name="confirm_password" class="form-control" required minlength="8">
+                                    </div>
+                                    <button type="submit" class="btn btn-primary w-100">Reset Password</button>
+                                </form>
+                            <?php else: ?>
+                                <p>Please check your email for a valid reset link or <a href="reset_request.php">request a new one</a>.</p>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
-        <footer>
-    <div class="row">
-      <div class="col"><p>Message</p></div>
-      <div class="col"><p>Message</p></div>
-    </div>  
-    </footer
     </div>
-    
-
-
-
-
-             <!-- Jquery JS-->
-    <script src="vendor/jquery-3.2.1.min.js"></script>
+                 <!-- Jquery JS-->
+                 <script src="vendor/jquery-3.2.1.min.js"></script>
     <!-- Bootstrap JS-->
     <script src="vendor/bootstrap-4.1/popper.min.js"></script>
     <script src="vendor/bootstrap-4.1/bootstrap.min.js"></script>
@@ -161,5 +155,4 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <!-- Main JS-->
     <script src="js/main.js"></script>
 </body>
-
 </html>
